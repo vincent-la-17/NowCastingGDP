@@ -1,0 +1,916 @@
+---
+title: "NowCasting GDP"
+author: "Minhaz Khan, Navin Chandradat, Bobak Ahmar, Vincent La"
+date: "14/09/2019"
+output: html_document
+---
+The problem that we will be tackling is the prediction of the quarters of the fiscal year. To do this, we will employ a technique called 
+NowCasting, which is the prediction of the current, and near future by examining data that occur at different frequencies and with 
+different lags. To begin, we'll first plot the monthly and quarterly GDPs against eachother. Next, we will fit a model based on the data 
+provided and examine the correlation between different months and quarters.
+
+```{r, fig.height=3, fig.width=5}
+# load required packages
+library(cansim)
+library(tidyverse)
+library(lubridate)
+library(modelr)
+library(broom)
+library(astsa)
+library(forecast)
+library(tseries)
+library(aTSA)
+library(xts) # better ts objects, including quarterly series
+library(tidyquant)
+library(timetk)
+library(sweep)
+
+```
+
+
+```{r}
+# Plot quarterly & monthly GDP 
+X2raw = get_cansim_vector( c( 
+  "monthly GDP (basic prices)" = "v65201210" ,
+  "quarterly GDP (market prices)" = "v62305752" ) ,
+    start_time = "1900-01-01" ) %>% 
+  normalize_cansim_values() 
+# (note correct vector code "v62305752" for quarterly GDP)
+X2raw %>% filter( Date >= "2010-01-01") %>% 
+  ggplot( aes( x = Date, y = VALUE, col = label ) ) +
+  geom_line() + geom_point() + ylab("Chained (2012) dollars")
+```
+
+
+```{r}
+# (note (basic prices) = (market prices) - (tax & subsidies), 
+#  and that is why monthly data values are lower)
+
+# Quartely data 
+Q = X2raw %>%  
+  filter( VECTOR == "v62305752" ) %>% 
+  # find year & quarter
+  mutate( Y = year( Date ), Q = quarter( Date ),
+          index = yearqtr( Y + Q/4 ) ) %>%  
+  xts( x=.$VALUE, order.by =.$index) 
+# plot(Q)
+# Monthly data 
+M = X2raw %>%  
+  filter( VECTOR == "v65201210" ) %>% 
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "M", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( M0 = lag(M0) ) %>% 
+  xts( x=.[,c("M0","M1","M2")], order.by =.$index) 
+#plot(M$M0); plot(M)
+# combine & align quarterly series with expanded monthly data
+X2 = merge(Q, M, join = "inner" )
+plot(X2)
+
+view(X2/(10^9))
+QScale = X2/(10^9)
+```
+
+Decomposing the Quarterly Data:
+```{r}
+decompose.xts <-
+function (x, type = c("additive", "multiplicative"), filter = NULL) 
+{
+  dts <- decompose(as.ts(x), type, filter)
+  dts$x <- .xts(dts$x, .index(x))
+  dts$seasonal <- .xts(dts$seasonal, .index(x))
+  dts$trend <- .xts(dts$trend, .index(x))
+  dts$random <- .xts(dts$random, .index(x))
+
+  with(dts,
+  structure(list(x = x, seasonal = seasonal, trend = trend,
+    random = if (type == "additive") x - seasonal - trend else x/seasonal/trend, 
+    figure = figure, type = type), class = "decomposed.xts"))
+}
+
+plot.decomposed.xts <-
+function(x, ...)
+{
+  xx <- x$x
+  if (is.null(xx))
+    xx <- with(x,
+      if (type == "additive") random + trend + seasonal
+      else random * trend * seasonal)
+  p <- cbind(observed = xx, trend = x$trend, seasonal = x$seasonal, random = x$random)
+  plot(p, main = paste("Decomposition of", x$type, "time series"), multi.panel = 4,
+       yaxis.same = FALSE, major.ticks = "days", grid.ticks.on = "days", ...)
+}
+
+QDecom = decompose.xts(QScale$Q)
+plot(QDecom)
+```
+There's a clear upward trend and seasonality present.
+
+Checking Stationarity of the Quarterly series:
+```{r}
+adf.test(QScale$Q) #Alternative stationary not working
+
+adf.test(as.ts(QScale$Q))
+```
+Not Stationary, have to implement differencing
+
+
+```{r}
+Qdiff = diff(log(QScale$Q), differences = 1)
+plot(Qdiff)
+adf.test(as.ts(Qdiff)) #Test not working
+
+acf(Qdiff, na.action = na.pass, main='ACF for Differenced Series')
+pacf(Qdiff, na.action = na.pass, main='PACF for Differenced Series') 
+```
+Data is stationary now, we test with AR 1 or 2 and MA 1 for arima model
+
+Standard ARMA model
+
+
+Arima models w/past information only -> 
+      w/ past information with M0 (start of quarter forecast) + M1 (1st month nowcast) + M2 (2nd month nowcast)
+```{r}
+(auto.model <- auto.arima(Qdiff, seasonal = FALSE))
+tsdisplay(residuals(auto.model), lag.max=45, main='(1,1,1) Model Residuals') 
+
+model.1 <- Arima( y = QScale$Q, order=c(1,1,1), include.drift = TRUE)
+tsdisplay(residuals(model.1), lag.max=45, main='(1,1,1) Model Residuals')
+
+model.2 <- Arima( y = QScale$Q, order=c(1,1,1),  xreg = QScale$M0, include.drift = TRUE)
+tsdisplay(residuals(model.2), lag.max=45, main='(1,1,1) Model Residuals')
+
+model.3 <- Arima( y = QScale$Q, order=c(1,1,1),  xreg = QScale[,c("M0","M1")], include.drift = TRUE)
+tsdisplay(residuals(model.3), lag.max=45, main='(1,1,1) Model Residuals')
+
+model.4 <- Arima( y = QScale$Q, order=c(1,1,1),  xreg = QScale[,c("M0","M1","M2")], include.drift = TRUE)
+tsdisplay(residuals(model.4), lag.max=45, main='(1,1,1) Model Residuals')
+
+model.1 ; model.2 ; model.3 ; model.4
+```
+
+Comparing AIC/BIC of models 
+```{r}
+AICS <- c(AIC(model.1),AIC(model.2),AIC(model.3),AIC(model.4))
+BICS <- c(BIC(model.1),BIC(model.2),BIC(model.3),BIC(model.4))
+Compare <- cbind(AICS,BICS)
+Compare
+```
+
+
+```{r}
+arima_analysis <- function(df,p,d,q, regs) {
+  
+  (model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE))
+  tsdisplay(residuals(model), lag.max=45, main='Model Residuals')
+  (Info_Score <- cbind(AIC(model),BIC(model)))
+  return(model)
+}
+```
+
+#Improving Model with Previous Month's Data
+```{r}
+#HERE AND BELOW
+#70-30% Split
+train0 = QScale[1:63]
+test0 = QScale[64:90]
+month0 <- arima_analysis(train0$Q,1,1,1,train0$M0)
+summary(month0)
+
+#Forecasting with the testing set
+cast0 = forecast::forecast(month0, xreg = test0[,c("M0")] )
+plot(cast0)
+
+n = nrow(QScale); 
+nCV = 20 # number of corss validation errors
+y_fe = y_fe. = rep(NA,n) # Y forecast error 
+
+
+
+#WENT OVER THIS WITH SOTIRIOS 
+X = cbind( t=1:nrow(QScale) , QScale)
+ 
+for(i in (n - nCV:1) ){
+  
+  print(i)
+  
+  # Increasing subsets of y,x
+  yt = QScale$Q[1:i]; xt = X[1:i,c("t","M0")]
+  out = arima( yt , order=c(1,1,1),  xreg = xt)
+  
+  
+  # 1-step-ahead forecast erros using predict() function
+  y_fe[i+1] = predict( out, newxreg = X[i+1, c("t","M0")] )$pred
+  
+  out2 = forecast::Arima( yt , order=c(1,1,1),  xreg = matrix( X[1:i,c("M0")] ), include.drift = T)
+  fit = forecast::forecast(out2, xreg = matrix( X[i+1, c("M0")], 1 )  )
+  
+}
+
+summary(fit)
+plot(fit)
+# Cross-Validated Performance 
+(MSPE = mean( (QScale$Q - y_fe)^2, na.rm = TRUE ))
+
+(MAPE = mean( abs(QScale$Q - y_fe)/abs(QScale$Q), na.rm = TRUE ))
+```
+
+
+
+
+#Improving Model with Previous 2 Month's Data
+```{r}
+train01 = QScale[1:63]
+test01 = QScale[64:90]
+month01 <- arima_analysis(train01$Q,1,1,1,train01[,c("M0","M1")])
+summary(month01)
+
+cast01 = forecast::forecast(month01, xreg = test01[,c("M0","M1")] )
+plot(cast01)
+
+n = nrow(QScale); 
+nCV = 20 # number of corss validation errors
+y_fe = y_fe. = rep(NA,n) # Y forecast error 
+
+
+
+#WENT OVER THIS WITH SOTIRIOS 
+X = cbind( t=1:nrow(QScale) , QScale)
+ 
+for(i in (n - nCV:1) ){
+  
+  print(i)
+  
+  # Increasing subsets of y,x
+  yt = QScale$Q[1:i]; xt = X[1:i,c("t","M0","M1")]
+  out = arima( yt , order=c(1,1,1),  xreg = xt)
+  
+  
+  # 1-step-ahead forecast erros using predict() function
+  y_fe[i+1] = predict( out, newxreg = X[i+1, c("t","M0","M1")] )$pred
+  
+  out2 = forecast::Arima( yt , order=c(1,1,1),  xreg = X[1:i,c("M0","M1")], include.drift = T)
+  fit = forecast::forecast(out2, xreg = as.matrix( X[i+1, c("M0","M1")], 1 )  )
+  
+}
+
+
+
+summary(fit)
+plot(fit)
+# Cross-Validated Performance 
+(MSPE = mean( (QScale$Q - y_fe)^2, na.rm = TRUE ))
+
+(MAPE = mean( abs(QScale$Q - y_fe)/abs(QScale$Q), na.rm = TRUE ))
+
+```
+
+#Improving Model with Previous 3 Month's Data
+```{r}
+train012 = QScale[1:63]
+test012 = QScale[64:90]
+month012 <- arima_analysis(train012$Q,1,1,1,train012[,c("M0","M1","M2")])
+summary(month012)
+
+cast012 = forecast::forecast(month012, xreg = test012[,c("M0","M1","M2")] )
+plot(cast012)
+
+n = nrow(QScale); 
+nCV = 20 # number of corss validation errors
+y_fe = y_fe. = rep(NA,n) # Y forecast error 
+
+
+
+#WENT OVER THIS WITH SOTIRIOS 
+X = cbind( t=1:nrow(QScale) , QScale)
+ 
+for(i in (n - nCV:1) ){
+  
+  print(i)
+  
+  # Increasing subsets of y,x
+  yt = QScale$Q[1:i]; xt = X[1:i,c("t","M0","M1","M2")]
+  out = arima( yt , order=c(1,1,1),  xreg = xt)
+  
+  
+  # 1-step-ahead forecast erros using predict() function
+  y_fe[i+1] = predict( out, newxreg = X[i+1, c("t","M0","M1","M2")] )$pred
+  
+  out2 = forecast::Arima( yt , order=c(1,1,1),  xreg = as.matrix( X[1:i,c("M0","M1","M2")] ), include.drift = T)
+  fit = forecast::forecast(out2, xreg = as.matrix( X[i+1, c("M0","M1","M2")], 1 )  )
+  
+}
+
+summary(fit)
+plot(fit)
+# Cross-Validated Performance 
+(MSPE = mean( (QScale$Q - y_fe)^2, na.rm = TRUE ))
+
+(MAPE = mean( abs(QScale$Q - y_fe)/abs(QScale$Q), na.rm = TRUE ))
+```
+
+#Functions for each Arima Models
+```{r}
+Arima0 <- function(df,p,d,q, regs) {
+  
+  model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE)
+  return(model)
+}
+Arima01 <- function(df,p,d,q, regs) {
+  
+  model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE)
+  return(model)
+}
+Arima012 <- function(df,p,d,q, regs) {
+  
+  model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE)
+  return(model)
+}
+```
+
+
+```{r}
+train_ts = QScale[1:63]
+test_ts = QScale[64:90]
+train_ts %>% tk_ts() -> train_ts
+test_ts %>% tk_ts() -> test_ts
+
+
+models_list <- list(
+    Arima0 = list(
+        df = train_ts[,1],p=1,d=1,q=1, regs = train_ts[,2]  
+        ),
+    Arima01 = list(
+        df = train_ts[,1],p=1,d=1,q=1, regs = train_ts[,2:3]
+    ),
+    Arima012 = list(
+        df = train_ts[,1],p=1,d=1,q=1, regs = train_ts[,2:4]
+    )
+)
+
+models_tbl <- enframe(models_list, name = "f", value = "params")
+
+
+models_tbl_fit <- models_tbl %>%
+    mutate(fit = invoke_map(f, params))
+
+
+models_tbl_fit %>%
+    mutate(tidy = map(fit, sw_tidy)) %>%
+    unnest(tidy) %>%
+    spread(key = f, value = estimate)
+
+models_tbl_fit %>%
+    mutate(glance = map(fit, sw_glance)) %>%
+    unnest(glance, .drop = TRUE)
+
+models_tbl_fit %>%
+    mutate(augment = map(fit, sw_augment, rename_index = "date")) %>%
+    unnest(augment) %>%
+    ggplot(aes(x = date, y = .resid, group = f)) +
+    geom_line(color = palette_light()[[2]]) +
+    geom_point(color = palette_light()[[1]]) +
+    geom_smooth(method = "loess") +
+    facet_wrap(~ f, nrow = 3) +
+    labs(title = "Residuals Plot") +
+    theme_tq()
+```
+
+
+Analyzing External Data
+
+```{r}
+LFS_2018 <- read_csv("LFS_Toronto 2018.csv")
+wages <- read_csv("Wages, salaries and employers' social contributions (x 1,000).csv")
+```
+
+```{r}
+# To get just the data that is seasonally adjusted
+wages <- wages %>% filter(`Seasonal adjustment` == "Seasonally adjusted") %>% filter(GEO != "Outside Canada")
+
+wages <- wages %>% mutate(REF_DATE = paste(REF_DATE, "01", sep = "-")) %>% 
+  mutate(REF_DATE = ymd(REF_DATE))
+
+wages
+```
+
+
+
+Analyzing External Data
+```{r}
+#Attempt at making LFS_2018 a TS
+LFS_2018 %>% select(lfsstat) -> lfs_st
+lfs_st
+ts(lfs_st, start = c(2018, 01), frequency = 12) -> lfs_st_ts
+
+plot(lfs_st_ts)
+```
+
+
+```{r}
+#Attempting to make Wages and salaries a TS
+wages %>% filter(GEO == "Canada") %>% 
+  filter(Sector == "Wages and salaries") %>% 
+  select(VALUE) -> CanWS
+CanWS
+
+
+ts(CanWS, start = c(1997,01), end = c(2019,6), frequency = 12) -> CanWS_ts_Monthly
+
+#Make monthly to Quarterly
+CanWS_ts_quarterly <- aggregate(CanWS_ts_Monthly, nfrequency = 4)
+CanWS_ts_quarterly
+
+CanWS_ts_Monthly <- as.xts(CanWS_ts_Monthly)
+CanWS_ts_quarterly <- as.xts(CanWS_ts_quarterly)
+
+#plot the ts 
+plot(CanWS_ts_Monthly, main='CanWS_ts_Monthly')
+plot(CanWS_ts_quarterly, main = 'CanWS_ts_quarterly')
+plot(decompose(CanWS_ts_Monthly))
+plot(decompose(CanWS_ts_quarterly))
+
+#difference to make stationary 
+# CanWS_ts_log_diff_q <- diff(log(CanWS_ts_quarterly))
+# CanWS_ts_log_diff_M <- diff(log(CanWS_ts_Monthly))
+# 
+# plot(CanWS_ts_log_diff_q)
+# plot(CanWS_ts_log_diff_M)
+```
+```{r}
+#Compensation of employees	Time series
+#Attempting to make Wages and salaries a TS
+wages %>% filter(GEO == "Canada") %>% 
+  filter(Sector == "Compensation of employees") %>% 
+  select(VALUE) -> Compensation
+Compensation
+
+
+ts(Compensation, start = c(1997,01), end = c(2019,6), frequency = 12) -> Compensation_M
+
+#Make monthly to Quarterly
+Compensation_Q <- aggregate(Compensation_M, nfrequency = 4)
+Compensation_Q
+
+Compensation_M <- as.xts(Compensation_M)
+Compensation_Q <- as.xts(Compensation_Q)
+
+#plot the ts 
+plot(Compensation_M, main = 'Compensation_M')
+plot(Compensation_Q, main = 'Compensation_Q')
+plot(decompose(Compensation_M))
+plot(decompose(Compensation_Q))
+
+#difference to make stationary 
+# Comp_l_q <- diff(log(Compensation_Q))
+# Comp_l_M <- diff(log(Compensation_M))
+# 
+# plot(Comp_l_q)
+# plot(Comp_l_M)
+```
+
+```{r}
+#All services-producing industries Time series
+wages %>% filter(GEO == "Canada") %>% 
+  filter(Sector == "All services-producing industries") %>% 
+  select(VALUE) -> services_prod
+services_prod
+
+
+ts(services_prod, start = c(1997,01), end = c(2019,6), frequency = 12) -> services_prod_M
+
+#Make monthly to Quarterly
+services_prod_Q <- aggregate(services_prod_M, nfrequency = 4)
+services_prod_Q
+
+services_prod_M <- as.xts(services_prod_M)
+services_prod_Q <- as.xts(services_prod_Q)
+
+#plot the ts 
+plot(services_prod_Q, main = 'services_prod_Q')
+plot(services_prod_M, main = 'services_prod_M')
+plot(decompose(services_prod_M))
+plot(decompose(services_prod_Q))
+
+#difference to make stationary 
+# services_l_q <- diff(log(services_prod_M))
+# services_l_M <- diff(log(services_prod_Q))
+# 
+# plot(services_l_q)
+# plot(services_l_M)
+```
+
+
+```{r}
+foreign_ex_rates <- read.csv("Monthly avg foreign exchange rates.csv")
+
+#foreign_ex_rates %>% rename(REF_DATE = ï..REF_DATE) %>% 
+#  mutate(REF_DATE = paste(REF_DATE, "01", sep = "-")) %>% 
+ # mutate(REF_DATE = ymd(REF_DATE)) 
+
+foreign_ex_rates_values <- foreign_ex_rates %>% 
+  filter(Type.of.currency  == 
+           "Canadian-Dollar Effective Exchange Rate Index (CERI), monthly average") %>% select(VALUE)
+
+
+#Create Ts
+ts(foreign_ex_rates_values, start = c(1997,01), end = c(2019,10), frequency = 12) -> CERI_ts
+
+plot(CERI_ts, main = 'Canadian Effective Exchange Rate Index - Monthly AVG')
+
+```
+
+```{r}
+load("my.RData")
+```
+
+```{r}
+## Note imports and exports are in terms of millions
+cpi; imports; exports; rates; ippi; raw_materials_pi
+```
+
+
+```{r}
+#Trying to merge importsTs to original data 
+# Monthly data 
+imports_xts = imports %>%  
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "importM", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( importM0 = lag(importM0) ) %>% 
+  xts( x=.[,c("importM0","importM1","importM2")], order.by =.$index)
+
+imports_xts <- imports_xts/(1000)
+
+# combine with Qscale
+Qscale_imports = merge(QScale, imports_xts, join = "inner" )
+Qscale_imports
+```
+
+
+```{r}
+#Trying to merge exportsTs to original data 
+# Monthly data 
+exports_xts = imports %>%  
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "exportM", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( exportM0 = lag(exportM0) ) %>% 
+  xts( x=.[,c("exportM0","exportM1","exportM2")], order.by =.$index)
+
+exports_xts <- exports_xts/(1000)
+
+# combine with Qscale_imports
+Qscale_exports = merge(Qscale_imports, exports_xts, join = "inner" )
+Qscale_exports
+```
+
+
+```{r}
+#Trying to merge rates Ts to original data 
+# Monthly data 
+rates_xts = rates %>%  
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "ratesM", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( ratesM0 = lag(ratesM0) ) %>% 
+  xts( x=.[,c("ratesM0","ratesM1","ratesM2")], order.by =.$index)
+
+# combine with Qscale_imports
+Qscale_rates = merge(Qscale_exports, rates_xts, join = "inner" )
+Qscale_rates
+```
+
+```{r}
+#Trying to merge rates Ts to original data 
+# Monthly data 
+ippi_xts = ippi %>%  
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "ippiM", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( ippiM0 = lag(ippiM0) ) %>% 
+  xts( x=.[,c("ippiM0","ippiM1","ippiM2")], order.by =.$index)
+
+# combine with Qscale_imports
+Qscale_ippi = merge(Qscale_rates, ippi_xts, join = "inner" )
+Qscale_ippi
+```
+
+```{r}
+#Trying to merge rates Ts to original data 
+# Monthly data 
+raw_mat_xts = raw_materials_pi %>%  
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "raw_matM", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( raw_matM0 = lag(raw_matM0) ) %>% 
+  xts( x=.[,c("raw_matM0","raw_matM1","raw_matM2")], order.by =.$index)
+
+# combine with Qscale_imports
+Qscale_raw_mat = merge(Qscale_ippi, raw_mat_xts, join = "inner" )
+Qscale_raw_mat
+```
+
+```{r}
+#Trying to merge rates Ts to original data 
+# Monthly data 
+cpi_xts = cpi %>%  
+  # find year, quarter, month, and month-in-quarter
+  mutate( Y = year( Date ), Q = quarter( Date ), 
+          index = yearqtr( Y + Q/4 ), 
+          M = month( Date ),
+          MinQ = paste( "cpiM", M%%3, sep="" ) ) %>%  
+  # spread monthly data into 3 columns one for each month-in-quarter
+  pivot_wider(id_cols = index, names_from = MinQ, 
+              values_from = VALUE ) %>% 
+  # take lag for M0
+  mutate( cpiM0 = lag(cpiM0) ) %>% 
+  xts( x=.[,c("cpiM0","cpiM1","cpiM2")], order.by =.$index)
+
+# combine with Qscale_imports
+Qscale_cpi = merge(Qscale_raw_mat, cpi_xts, join = "inner" )
+Qscale_cpi
+```
+
+```{r}
+# First to fill the NAs with the means of the exchange rates
+
+mean_ratesM0 <- mean(Qscale_cpi[,"ratesM0"], na.rm = T)
+
+mean_ratesM1 <- mean(Qscale_cpi[,"ratesM1"], na.rm = T)
+
+mean_ratesM2 <- mean(Qscale_cpi[,"ratesM2"], na.rm = T)
+
+Qscale_cpi[,"ratesM0"] <- na.fill(Qscale_cpi[,"ratesM0"], mean_ratesM0)
+
+Qscale_cpi[,"ratesM1"] <- na.fill(Qscale_cpi[,"ratesM1"], mean_ratesM1)
+
+Qscale_cpi[,"ratesM2"] <- na.fill(Qscale_cpi[,"ratesM2"], mean_ratesM2)
+
+view(Qscale_cpi)
+```
+
+
+
+Now to subset the data
+```{r}
+# First we want all the month0 variables
+
+month0_ext <- Qscale_cpi[,c("Q","M0","importM0","exportM0","ratesM0","ippiM0","raw_matM0","cpiM0")]
+
+#month0_ext <- na.fill(month0_ext, 0)
+
+month0_ext
+```
+
+
+```{r}
+# Now First we want all the month01 variables
+
+month01_ext <- Qscale_cpi[,c("Q","M0","M1","importM0","importM1",
+                             "exportM0","exportM1","ratesM0","ratesM1",
+                             "ippiM0","ippiM1","raw_matM0","raw_matM1","cpiM0","cpiM1")]
+
+
+mean_M0 <- mean(month01_ext[,"M0"], na.rm = T)
+month01_ext[,"M0"] <- na.fill(month01_ext[,"M0"], mean_M0)
+
+month01_ext
+```
+
+
+```{r}
+# Now First we want all the month012 variables
+
+month012_ext <- Qscale_cpi
+
+#month01_ext <- na.fill(month01_ext, 0)
+
+(month012_ext <- na.fill(month012_ext,0))
+```
+
+```{r}
+# using step function to automate selection
+
+modelselect0 = lm(Q~M0+importM0+exportM0+ratesM0+ippiM0+raw_matM0+cpiM0, data = diff(month0_ext))
+summary(modelselect0)
+
+modelselect0.1 <- step(modelselect0, direction = "backward")
+
+summary(modelselect0.1)
+```
+
+
+```{r}
+modelselect01 = lm(Q~M0+M1+importM0+importM1+exportM0+exportM1+ratesM0+ratesM1+ippiM0+ippiM1+raw_matM0+raw_matM1+cpiM0+cpiM1, data = diff(month01_ext))
+summary(modelselect01)
+
+modelselect01.1 <- step(modelselect01, direction = "backward")
+
+summary(modelselect01.1)
+```
+
+
+
+```{r}
+modelselect012 = lm(Q~M0+M1+M2+importM0+importM1+importM2+exportM0+exportM1+exportM2+ratesM0+ratesM1+ratesM2+ippiM0+ippiM1+ippiM2+raw_matM0+raw_matM1+raw_matM2+cpiM0+cpiM1+cpiM2, data = diff(month012_ext, lag = 1))
+summary(modelselect012)
+
+modelselect012.1 <- step(modelselect012, direction = "backward")
+
+summary(modelselect012.1)
+```
+
+Running month012 model with only the significant variables chosen:
+```{r}
+month012_opt = lm(Q~M1+M2+importM2+raw_matM1, data = month012_ext)
+summary(month012_opt)
+plot(month012_opt)
+```
+These variables are the most significant in determining the next quarter's value from this dataset. The previous month's data was found to be not significant.
+
+Arima Model to forecast based on new regressors:
+M012 MODEL
+```{r}
+train012 = month012_ext[1:64]
+test012 = month012_ext[65:91]
+month012 <- arima_analysis(train012$Q,1,1,1,train012[,c("M1","M2","importM2","raw_matM1")])
+summary(month012)
+
+cast012 = forecast::forecast(month012, xreg = test012[,c("M1","M2","importM2","raw_matM1")] )
+plot(cast012)
+
+n = nrow(month012_ext); 
+nCV = 20 # number of corss validation errors
+y_fe = y_fe. = rep(NA,n) # Y forecast error 
+
+
+
+#WENT OVER THIS WITH SOTIRIOS 
+X = cbind( t=1:nrow(month012_ext) , month012_ext)
+ 
+for(i in (n - nCV:1) ){
+  
+  print(i)
+  
+  # Increasing subsets of y,x
+  yt = QScale$Q[1:i]; xt = X[1:i,c("t","M1","M2","importM2","raw_matM1")]
+  out = arima( yt , order=c(1,1,1),  xreg = xt)
+  
+  
+  # 1-step-ahead forecast erros using predict() function
+  y_fe[i+1] = predict( out, newxreg = X[i+1, c("t","M1","M2","importM2","raw_matM1")] )$pred
+  
+  out2 = forecast::Arima( yt , order=c(1,1,1),  xreg = as.matrix( X[1:i,c("M1","M2","importM2","raw_matM1")] ), include.drift = T)
+  fit = forecast::forecast(out2, xreg = as.matrix( X[i+1, c("M1","M2","importM2","raw_matM1")], 1 )  )
+  
+}
+
+summary(fit)
+plot(fit)
+# Cross-Validated Performance 
+(MSPE = mean( (month012_ext$Q - y_fe)^2, na.rm = TRUE ))
+
+(MAPE = mean( abs(month012_ext$Q - y_fe)/abs(month012_ext$Q), na.rm = TRUE ))
+```
+
+#Functions for each Arima Models
+```{r}
+Arima0 <- function(df,p,d,q, regs) {
+  
+  model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE)
+  return(model)
+}
+Arima01 <- function(df,p,d,q, regs) {
+  
+  model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE)
+  return(model)
+}
+Arima012 <- function(df,p,d,q, regs) {
+  
+  model <- Arima( y = df, order=c(p,d,q), xreg = regs, include.drift = TRUE)
+  return(model)
+}
+```
+M01 MODEL
+```{r}
+training01 = month01_ext[1:64]
+testing01 = month01_ext[65:90]
+month01arima <- arima_analysis(training01$Q,1,1,1,training01[,c("M1","ippiM0","cpiM0","raw_matM1")])
+summary(month01arima)
+
+cast01 = forecast::forecast(month01arima, xreg = testing01[,c("M1","ippiM0","cpiM0","raw_matM1")])
+plot(cast01)
+
+n = nrow(month0_ext); 
+nCV = 20 # number of corss validation errors
+y_fe = y_fe. = rep(NA,n) # Y forecast error 
+
+
+
+#WENT OVER THIS WITH SOTIRIOS 
+X = cbind( t=1:nrow(month01_ext) , month01_ext)
+
+for(i in (n - nCV:1) ){
+  
+  print(i)
+  
+  # Increasing subsets of y,x
+  yt = month01_ext$Q[1:i]; xt = X[1:i,c("t","M1","ippiM0","cpiM0","raw_matM1")]
+  out = arima( yt , order=c(1,1,1),  xreg = xt)
+  
+  
+  # 1-step-ahead forecast erros using predict() function
+  y_fe[i+1] = predict( out, newxreg = X[i+1, c("t","M1","ippiM0","cpiM0","raw_matM1")] )$pred
+  
+  out2 = forecast::Arima( yt , order=c(1,1,1),  xreg = as.matrix( X[1:i,c("M1","ippiM0","cpiM0","raw_matM1")] ), include.drift = T)
+  fit = forecast::forecast(out2, xreg = as.matrix( X[i+1, c("M1","ippiM0","cpiM0","raw_matM1")], 1 )  )
+  
+}
+
+summary(fit)
+plot(fit)
+# Cross-Validated Performance 
+(MSPE = mean( (month01_ext$Q - y_fe)^2, na.rm = TRUE ))
+
+(MAPE = mean( abs(month01_ext$Q - y_fe)/abs(month01_ext$Q), na.rm = TRUE ))
+```
+M0 MODEL
+```{r}
+training0 = month0_ext[1:64]
+testing0 = month0_ext[65:90]
+month0arima <- arima_analysis(training0$Q,1,1,1,training0[,c("M0","importM0","cpiM0","raw_matM0")])
+summary(month0arima)
+
+cast0 = forecast::forecast(month0arima, xreg = testing0[,c("M0","importM0","cpiM0","raw_matM0")])
+plot(cast0)
+
+n = nrow(month0_ext); 
+nCV = 20 # number of corss validation errors
+y_fe = y_fe. = rep(NA,n) # Y forecast error 
+
+
+
+#WENT OVER THIS WITH SOTIRIOS 
+X = cbind( t=1:nrow(month0_ext) , month0_ext)
+
+for(i in (n - nCV:1) ){
+  
+  print(i)
+  
+  # Increasing subsets of y,x
+  yt = month0_ext$Q[1:i]; xt = X[1:i,c("t","M0","importM0","cpiM0","raw_matM0")]
+  out = arima( yt , order=c(1,1,1),  xreg = xt)
+  
+  
+  # 1-step-ahead forecast erros using predict() function
+  y_fe[i+1] = predict( out, newxreg = X[i+1, c("t","M0","importM0","cpiM0","raw_matM0")] )$pred
+  
+  out2 = forecast::Arima( yt , order=c(1,1,1),  xreg = as.matrix( X[1:i,c("M0","importM0","cpiM0","raw_matM0")] ), include.drift = T)
+  fit = forecast::forecast(out2, xreg = as.matrix( X[i+1, c("M0","importM0","cpiM0","raw_matM0")], 1 )  )
+  
+}
+
+summary(fit)
+plot(fit)
+# Cross-Validated Performance 
+(MSPE = mean( (month0_ext$Q - y_fe)^2, na.rm = TRUE ))
+
+(MAPE = mean( abs(month0_ext$Q - y_fe)/abs(month0_ext$Q), na.rm = TRUE ))
+```

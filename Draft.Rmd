@@ -1,0 +1,62 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+
+```{r}
+library(cansim)
+library(tidyverse)
+library(lubridate)
+library(modelr)
+library(broom)
+library(astsa)
+library(dplyr)
+```
+```{r}
+# plot quarterly & monthly GDP 
+#This code is from the Draft
+get_cansim_vector( c( 
+  "monthly GDP" = "v65201210",
+  "quarterly GDP" = "v1000000673") ,
+    start_time = "2015-01-01" ) %>% 
+  normalize_cansim_values() %>% 
+  ggplot( aes( x = Date, y = VALUE, col = label ) ) +
+  geom_line() + geom_point() + ylab("Chained (2012) dollars") +
+  ggtitle("Problem 2: Plot of quarterly & monthly GDP")
+```
+The graph shows that both the monthly and quarterly GDPs increase at almost exactly the same rate. This suggests that
+perhaps the two are highly correlated.
+
+
+In order to get a closer look at the existing pattern, we separated the monthly and quarterly GDP and then graphed them.
+```{r}
+y = get_cansim_vector( c( 
+  "monthly GDP (basic prices)" = "v65201210",
+  "quarterly GDP (expend-based)" = "v62305723") ,
+    start_time = "2010-01-01" ) %>% 
+  normalize_cansim_values() %>% 
+  ggplot( aes( x = Date, y =VALUE, col = label ) ) +
+  geom_line() + geom_point() + ylab("Chained (2012) dollars")
+detrend(y, tt='linear', bp=c())
+```
+
+Retrieving the data frame:
+```{r}
+get_cansim_vector( c( 
+  "monthly GDP (basic prices)" = "v65201210",
+  "quarterly GDP (expend-based)" = "v62305723") ,
+    start_time = "2009-01-01" ) %>% 
+    normalize_cansim_values() -> ncastDF
+ncastDF
+```
+
+
+```{r}
+ncastQuarter <- subset(ncastDF, subset = (label == "quarterly GDP (expend-based)"))
+ncastMonthly <- subset(ncastDF, subset = (label == "monthly GDP (basic prices)"))
+MonthlyRegression = lm(VALUE~REF_DATE,ncastMonthly)
+ncastTS = ts(ncastQuarter)
+```
+
+
